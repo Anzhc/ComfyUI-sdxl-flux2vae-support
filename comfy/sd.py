@@ -672,33 +672,73 @@ class VAE:
                 pixels = pixels.narrow(d + 1, x_offset, x)
         return pixels
 
+    def set_packed_latents(self, packed_channels, spatial_factor=2):
+        self.packed_latent_channels = packed_channels
+        self.packed_latent_spatial_factor = spatial_factor
+
+    def _to_vae_latent(self, latent):
+        packed_channels = getattr(self, "packed_latent_channels", None)
+        sf = getattr(self, "packed_latent_spatial_factor", 2)
+        if packed_channels is None and latent.shape[1] * (sf ** 2) == getattr(self, "latent_channels", latent.shape[1]):
+            # Allow implicit packing when latents are spatially packed (32 -> 128 for flux2)
+            packed_channels = latent.shape[1]
+        if packed_channels is not None and latent.shape[1] == packed_channels:
+            if packed_channels * (sf ** 2) == self.latent_channels and latent.ndim >= 4:
+                # Rearrange spatial 2x2 blocks into channel dimension (inverse of Flux2 preview reshape)
+                h = latent.shape[-2]
+                w = latent.shape[-1]
+                if h % sf != 0 or w % sf != 0:
+                    pad_h = (sf - (h % sf)) % sf
+                    pad_w = (sf - (w % sf)) % sf
+                    latent = torch.nn.functional.pad(latent, (0, pad_w, 0, pad_h))
+                    h = latent.shape[-2]
+                    w = latent.shape[-1]
+                latent = latent.reshape(latent.shape[0], packed_channels, h // sf, sf, w // sf, sf)
+                latent = latent.permute(0, 1, 3, 5, 2, 4).reshape(latent.shape[0], self.latent_channels, h // sf, w // sf)
+        return latent
+
+    def _from_vae_latent(self, latent):
+        packed_channels = getattr(self, "packed_latent_channels", None)
+        sf = getattr(self, "packed_latent_spatial_factor", 2)
+        if packed_channels is None and self.latent_channels == 128 and latent.shape[1] == 128:
+            packed_channels = 32  # implicit flux2 packing
+        if packed_channels is not None and latent.shape[1] == self.latent_channels:
+            if packed_channels * (sf ** 2) == self.latent_channels and latent.ndim >= 4:
+                h = latent.shape[-2]
+                w = latent.shape[-1]
+                latent = latent.reshape(latent.shape[0], packed_channels, sf, sf, h, w)
+                latent = latent.permute(0, 1, 4, 2, 5, 3).reshape(latent.shape[0], packed_channels, h * sf, w * sf)
+        return latent
+
     def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap = 16):
         steps = samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x, tile_y, overlap)
         steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x // 2, tile_y * 2, overlap)
         steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x * 2, tile_y // 2, overlap)
         pbar = comfy.utils.ProgressBar(steps)
 
-        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+        decode_fn = lambda a: self.first_stage_model.decode(self._to_vae_latent(a).to(self.vae_dtype).to(self.device)).float()
+        input_samples = self._to_vae_latent(samples)
         output = self.process_output(
-            (comfy.utils.tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar) +
-            comfy.utils.tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar) +
-             comfy.utils.tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar))
+            (comfy.utils.tiled_scale(input_samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar) +
+            comfy.utils.tiled_scale(input_samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar) +
+             comfy.utils.tiled_scale(input_samples, decode_fn, tile_x, tile_y, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar))
             / 3.0)
         return output
 
     def decode_tiled_1d(self, samples, tile_x=128, overlap=32):
         if samples.ndim == 3:
-            decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+            decode_fn = lambda a: self.first_stage_model.decode(self._to_vae_latent(a).to(self.vae_dtype).to(self.device)).float()
         else:
             og_shape = samples.shape
             samples = samples.reshape((og_shape[0], og_shape[1] * og_shape[2], -1))
-            decode_fn = lambda a: self.first_stage_model.decode(a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1])).to(self.vae_dtype).to(self.device)).float()
+            decode_fn = lambda a: self.first_stage_model.decode(self._to_vae_latent(a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1]))).to(self.vae_dtype).to(self.device)).float()
 
         return self.process_output(comfy.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_x,), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device))
 
     def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
-        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        return self.process_output(comfy.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
+        decode_fn = lambda a: self.first_stage_model.decode(self._to_vae_latent(a).to(self.vae_dtype).to(self.device)).float()
+        input_samples = self._to_vae_latent(samples)
+        return self.process_output(comfy.utils.tiled_scale_multidim(input_samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
 
     def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap = 64):
         steps = pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x, tile_y, overlap)
@@ -711,7 +751,7 @@ class VAE:
         samples += comfy.utils.tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount = (1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device, pbar=pbar)
         samples += comfy.utils.tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = (1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device, pbar=pbar)
         samples /= 3.0
-        return samples
+        return self._from_vae_latent(samples)
 
     def encode_tiled_1d(self, samples, tile_x=256 * 2048, overlap=64 * 2048):
         if self.latent_dim == 1:
@@ -727,6 +767,7 @@ class VAE:
             encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).reshape(1, out_channels, -1).float()
 
         out = comfy.utils.tiled_scale_multidim(samples, encode_fn, tile=(tile_x,), overlap=overlap, upscale_amount=upscale_amount, out_channels=out_channels, output_device=self.output_device)
+        out = self._from_vae_latent(out)
         if self.latent_dim == 1:
             return out
         else:
@@ -734,7 +775,8 @@ class VAE:
 
     def encode_tiled_3d(self, samples, tile_t=9999, tile_x=512, tile_y=512, overlap=(1, 64, 64)):
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
-        return comfy.utils.tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
+        out = comfy.utils.tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
+        return self._from_vae_latent(out)
 
     def decode(self, samples_in, vae_options={}):
         self.throw_exception_if_invalid()
@@ -748,7 +790,7 @@ class VAE:
             batch_number = max(1, batch_number)
 
             for x in range(0, samples_in.shape[0], batch_number):
-                samples = samples_in[x:x+batch_number].to(self.vae_dtype).to(self.device)
+                samples = self._to_vae_latent(samples_in[x:x+batch_number]).to(self.vae_dtype).to(self.device)
                 out = self.process_output(self.first_stage_model.decode(samples, **vae_options).to(self.output_device).float())
                 if pixel_samples is None:
                     pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
@@ -823,7 +865,7 @@ class VAE:
             samples = None
             for x in range(0, pixel_samples.shape[0], batch_number):
                 pixels_in = self.process_input(pixel_samples[x:x + batch_number]).to(self.vae_dtype).to(self.device)
-                out = self.first_stage_model.encode(pixels_in).to(self.output_device).float()
+                out = self._from_vae_latent(self.first_stage_model.encode(pixels_in).to(self.output_device).float())
                 if samples is None:
                     samples = torch.empty((pixel_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
                 samples[x:x + batch_number] = out
@@ -1317,6 +1359,8 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         vae_sd = comfy.utils.state_dict_prefix_replace(sd, {k: "" for k in model_config.vae_key_prefix}, filter_keys=True)
         vae_sd = model_config.process_vae_state_dict(vae_sd)
         vae = VAE(sd=vae_sd, metadata=metadata)
+        if hasattr(model_config, "packed_vae_latent_channels"):
+            vae.set_packed_latents(model_config.packed_vae_latent_channels, getattr(model_config, "packed_vae_spatial_factor", 2))
 
     if output_clip:
         clip_target = model_config.clip_target(state_dict=sd)

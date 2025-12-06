@@ -227,6 +227,14 @@ class Flux2(LatentFormat):
     def process_out(self, latent):
         return latent
 
+class SDXL_Flux2(Flux2):
+    latent_channels = 32
+
+    def __init__(self):
+        super().__init__()
+        # SDXL Flux2 models emit 32-channel latents, reusing the Flux2 VAE scaling.
+        self.latent_rgb_factors_reshape = None
+
 class Mochi(LatentFormat):
     latent_channels = 12
     latent_dimensions = 3
